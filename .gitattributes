@@ -1,0 +1,2 @@
+# Consistent LF in the repo (good for Linux/Render); quietens CRLF warnings on Windows.
+* text=auto eol=lf
