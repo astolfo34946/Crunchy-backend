@@ -209,6 +209,44 @@ _PREMIUM_TRUE_RE = re.compile(r'"(?:is_)?premium"\s*:\s*true\b')
 _PREMIUM_FALSE_RE = re.compile(r'"(?:is_)?premium"\s*:\s*false\b')
 
 
+def _any_premium_true_flags(data: dict, blob: str) -> bool:
+    """True if any structured or JSON-text signal says the user has premium access."""
+    if not isinstance(data, dict):
+        return bool(_PREMIUM_TRUE_RE.search(blob))
+    if (
+        data.get("premium") is True
+        or data.get("is_premium") is True
+        or data.get("has_premium") is True
+    ):
+        return True
+    if (
+        _dict_has_key_bool(data, "premium", True)
+        or _dict_has_key_bool(data, "is_premium", True)
+        or _dict_has_key_bool(data, "has_premium", True)
+    ):
+        return True
+    return bool(_PREMIUM_TRUE_RE.search(blob))
+
+
+def _any_premium_false_flags(data: dict, blob: str) -> bool:
+    """True if a non-premium flag appears (nested objects may mix; compare with _any_premium_true_flags)."""
+    if not isinstance(data, dict):
+        return bool(_PREMIUM_FALSE_RE.search(blob))
+    if (
+        data.get("premium") is False
+        or data.get("is_premium") is False
+        or data.get("has_premium") is False
+    ):
+        return True
+    if (
+        _dict_has_key_bool(data, "premium", False)
+        or _dict_has_key_bool(data, "is_premium", False)
+        or _dict_has_key_bool(data, "has_premium", False)
+    ):
+        return True
+    return bool(_PREMIUM_FALSE_RE.search(blob))
+
+
 def _slug_to_label(s: str) -> str:
     s = (s or "").strip().lower().replace("-", "_").replace(" ", "_")
     mapping = {
@@ -289,31 +327,13 @@ def _infer_subscription_from_dict(data: dict) -> str:
             return "Mega Fan"
         return "Fan"
 
-    # Explicit premium flags (root or nested). True before false so paid tiers win.
-    if (
-        data.get("premium") is True
-        or data.get("is_premium") is True
-        or data.get("has_premium") is True
-        or _dict_has_key_bool(data, "premium", True)
-        or _dict_has_key_bool(data, "is_premium", True)
-        or _dict_has_key_bool(data, "has_premium", True)
-        or _PREMIUM_TRUE_RE.search(blob)
-    ):
+    # Premium booleans: ANY true wins over ANY false (nested payloads often list both).
+    if _any_premium_true_flags(data, blob):
         return "Premium"
-
-    if (
-        data.get("premium") is False
-        or data.get("is_premium") is False
-        or data.get("has_premium") is False
-        or _dict_has_key_bool(data, "premium", False)
-        or _dict_has_key_bool(data, "is_premium", False)
-        or _dict_has_key_bool(data, "has_premium", False)
-        or _PREMIUM_FALSE_RE.search(blob)
-    ):
+    if _any_premium_false_flags(data, blob):
         return "Free"
 
-    # No explicit paid-tier match; free-tier responses often omit premium keys entirely.
-    return "Free"
+    return ""
 
 
 def _deep_find_subscription_tier(data: dict, depth: int = 0, max_depth: int = 10) -> str:
@@ -357,6 +377,25 @@ def _deep_find_subscription_tier(data: dict, depth: int = 0, max_depth: int = 10
                     if inner:
                         return inner
     return ""
+
+
+def _subscription_label_from_accounts_me(data: dict) -> str:
+    """
+    Last resort for successful GET accounts/v1/me only.
+    Do not guess Free from empty token/JWT — only from this full profile or explicit flags.
+    """
+    blob = json.dumps(data).lower()
+    if "mega_fan" in blob or "megafan" in blob:
+        return "Mega Fan"
+    if "fan_membership" in blob:
+        return "Mega Fan" if "mega" in blob else "Fan"
+    if "trial" in blob and "subscription" in blob:
+        return "Trial"
+    if _any_premium_true_flags(data, blob):
+        return "Premium"
+    if _any_premium_false_flags(data, blob):
+        return "Free"
+    return "Unknown"
 
 
 def _fetch_subscription_label(
@@ -426,7 +465,7 @@ def _fetch_subscription_label(
         label = _deep_find_subscription_tier(data)
         if _ok(label):
             return _sanitize_subscription_label(label)
-        return "Unknown"
+        return _subscription_label_from_accounts_me(data)
     except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError):
         return "Unknown"
 
