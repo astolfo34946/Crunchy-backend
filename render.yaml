@@ -1,0 +1,9 @@
+# Use this file at the ROOT of a GitHub repo that contains ONLY this backend
+# (these files not inside a subfolder). On Render: New → Blueprint → connect repo.
+
+services:
+  - type: web
+    name: crunchyroll-checker-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
