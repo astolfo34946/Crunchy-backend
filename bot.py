@@ -185,6 +185,29 @@ def _sanitize_subscription_label(s: str) -> str:
     return s
 
 
+def _explicit_free_tier_flags(data: dict) -> bool:
+    """True when API explicitly marks the user as not premium (free tier)."""
+    true_flags = (
+        data.get("is_premium"),
+        data.get("premium"),
+        data.get("has_premium"),
+        data.get("hasPremium"),
+        data.get("isPremium"),
+    )
+    if any(v is True for v in true_flags):
+        return False
+    false_flags = (
+        data.get("is_premium"),
+        data.get("premium"),
+        data.get("has_premium"),
+        data.get("hasPremium"),
+        data.get("isPremium"),
+    )
+    if any(v is False for v in false_flags):
+        return True
+    return False
+
+
 def _slug_to_label(s: str) -> str:
     s = (s or "").strip().lower().replace("-", "_").replace(" ", "_")
     mapping = {
@@ -207,6 +230,8 @@ def _slug_to_label(s: str) -> str:
         return "Trial"
     if "family" in s:
         return "Family"
+    if "not_premium" in s or "non_premium" in s or "nonpremium" in s:
+        return "Free"
     if "premium" in s or "paid" in s:
         return "Premium"
     if "free" in s:
@@ -246,7 +271,17 @@ def _infer_subscription_from_dict(data: dict) -> str:
 
     sub = data.get("subscription") or data.get("membership")
     if isinstance(sub, dict):
-        for subk in ("tier", "plan", "name", "type"):
+        for subk in (
+            "tier",
+            "plan",
+            "name",
+            "type",
+            "code",
+            "product",
+            "sku",
+            "subscription_type",
+            "plan_name",
+        ):
             inner = sub.get(subk)
             if isinstance(inner, str) and inner.strip():
                 lbl = _slug_to_label(inner)
@@ -256,19 +291,18 @@ def _infer_subscription_from_dict(data: dict) -> str:
         cand = _slug_to_label(sub) or sub.strip()
         return _sanitize_subscription_label(cand)
 
-    blob = json.dumps(data).lower()
-    if "mega_fan" in blob or "megafan" in blob:
-        return "Mega Fan"
-    if "trial" in blob and "subscription" in blob:
-        return "Trial"
-    if "fan_membership" in blob or '"fan"' in blob:
-        if "mega" in blob:
-            return "Mega Fan"
-        return "Fan"
-    if "free" in blob and "premium" not in blob and "fan" not in blob:
+    # Nested structured fields only (no serialized JSON / blob heuristics).
+    deep = _deep_find_subscription_tier(data)
+    if deep:
+        return deep
+
+    # Free tier: explicit boolean flags from API (after tier strings so nested paid plans win).
+    if _explicit_free_tier_flags(data):
         return "Free"
-    if "premium" in blob:
-        return "Premium"
+    for nest_key in ("account", "profile", "crm_profile", "user"):
+        nested = data.get(nest_key)
+        if isinstance(nested, dict) and _explicit_free_tier_flags(nested):
+            return "Free"
 
     return ""
 
@@ -279,16 +313,22 @@ def _deep_find_subscription_tier(data: dict, depth: int = 0, max_depth: int = 10
         return ""
     tier_keys = (
         "subscription_type",
+        "subscription_tier",
+        "subscription_plan",
         "tier",
         "plan",
         "product",
         "sku",
+        "product_code",
         "membership_type",
         "fan_status",
         "plan_name",
         "offer_code",
         "package_code",
         "billing_plan",
+        "entitlement_tier",
+        "crm_subscription_type",
+        "plan_tier",
     )
     for k in tier_keys:
         if k not in data:
@@ -332,22 +372,13 @@ def _fetch_subscription_label(
             label = _infer_subscription_from_dict(claims)
             if _ok(label):
                 return _sanitize_subscription_label(label)
-            label = _deep_find_subscription_tier(claims)
-            if _ok(label):
-                return _sanitize_subscription_label(label)
         for k in ("crm_profile", "account", "profile"):
             nested = token_body.get(k)
             if isinstance(nested, dict):
                 label = _infer_subscription_from_dict(nested)
                 if _ok(label):
                     return _sanitize_subscription_label(label)
-                label = _deep_find_subscription_tier(nested)
-                if _ok(label):
-                    return _sanitize_subscription_label(label)
         label = _infer_subscription_from_dict(token_body)
-        if _ok(label):
-            return _sanitize_subscription_label(label)
-        label = _deep_find_subscription_tier(token_body)
         if _ok(label):
             return _sanitize_subscription_label(label)
 
@@ -356,9 +387,6 @@ def _fetch_subscription_label(
         claims = _jwt_payload_dict(access_token)
         if claims:
             label = _infer_subscription_from_dict(claims)
-            if _ok(label):
-                return _sanitize_subscription_label(label)
-            label = _deep_find_subscription_tier(claims)
             if _ok(label):
                 return _sanitize_subscription_label(label)
 
@@ -378,9 +406,6 @@ def _fetch_subscription_label(
         if not isinstance(data, dict):
             return "Unknown"
         label = _infer_subscription_from_dict(data)
-        if _ok(label):
-            return _sanitize_subscription_label(label)
-        label = _deep_find_subscription_tier(data)
         if _ok(label):
             return _sanitize_subscription_label(label)
         return "Unknown"
