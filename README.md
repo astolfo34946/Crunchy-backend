@@ -18,6 +18,7 @@ Self-contained backend for [Render](https://render.com) or any Python host.
 
 3. After deploy, copy your service URL (e.g. `https://crunchyroll-checker-api.onrender.com`).
 
+<<<<<<< HEAD
 4. **CORS:** In Render → your service → **Environment**, set:
 
    `CORS_ORIGINS` = `https://your-frontend-domain.com`
@@ -27,13 +28,26 @@ Self-contained backend for [Render](https://render.com) or any Python host.
 5. **Redeploy** after env or code changes (Dashboard → Manual Deploy).
 
 6. **Frontend:** Build the React app with `VITE_API_URL` set to that same API URL (see `web/.env.example` in the main project).
+=======
+4. **CORS:** In Render → your service → **Environment**, add:
+
+   `CORS_ORIGINS` = `https://your-frontend-domain.com,http://localhost:5173`
+
+   Use the exact origin(s) where your React app runs (no trailing slash on the URL).
+
+5. **Frontend:** Build the React app with `VITE_API_URL` set to that same API URL (see `web/.env.example` in the main project).
+>>>>>>> 53e0d03a4ebe3c606d275a4bce8194f1642a3391
 
 ## Optional environment variables
 
 | Variable         | Purpose |
 |------------------|---------|
 | `CRUNCHYROLL_AUTH` | `Basic …` OAuth client header if the bundled client is rotated |
+<<<<<<< HEAD
 | `CORS_ORIGINS`     | Extra production origins (localhost:5173 is always included) |
+=======
+| `CORS_ORIGINS`     | Comma-separated allowed browser origins |
+>>>>>>> 53e0d03a4ebe3c606d275a4bce8194f1642a3391
 
 ## Monorepo
 

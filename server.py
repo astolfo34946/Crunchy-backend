@@ -25,6 +25,7 @@ from bot import RunSummary, check_result_to_dict, run_checks_collecting
 
 app = FastAPI(title="Crunchyroll Checker API")
 
+<<<<<<< HEAD
 # Always allowed for local Vite/React dev (merged with CORS_ORIGINS from Render).
 _CORS_DEV_ORIGINS = [
     "http://127.0.0.1:5173",
@@ -44,6 +45,19 @@ def _cors_origins() -> list[str]:
             seen.add(o)
             out.append(o)
     return out
+=======
+
+def _cors_origins() -> list[str]:
+    raw = os.environ.get("CORS_ORIGINS", "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+    ]
+>>>>>>> 53e0d03a4ebe3c606d275a4bce8194f1642a3391
 
 
 app.add_middleware(
@@ -87,11 +101,14 @@ def health():
     return {"ok": True}
 
 
+<<<<<<< HEAD
 @app.get("/api/ping")
 def ping():
     return {"pong": True}
 
 
+=======
+>>>>>>> 53e0d03a4ebe3c606d275a4bce8194f1642a3391
 @app.post("/api/check", response_model=CheckResponse)
 async def check_accounts(body: CheckRequest):
     lines = [ln.strip() for ln in body.combos.splitlines() if ln.strip()]
