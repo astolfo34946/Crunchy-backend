@@ -14,14 +14,25 @@ Local:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import time
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from bot import RunSummary, check_result_to_dict, run_checks_collecting
+from bot import (
+    MAX_ACCOUNTS_PER_RUN,
+    CheckResult,
+    RunSummary,
+    build_summary,
+    check_result_to_dict,
+    iter_checks_sequential,
+    run_checks_collecting,
+)
 
 app = FastAPI(title="Crunchyroll Checker API")
 
@@ -63,7 +74,7 @@ app.add_middleware(
 
 class CheckRequest(BaseModel):
     combos: str = Field(..., description="One email:password per line")
-    threads: int = Field(3, ge=1, le=10)
+    threads: int = Field(1, ge=1, le=2, description="Ignored; API uses sequential checks.")
     delay: float = Field(0.0, ge=0.0, le=120.0)
     proxies: Optional[str] = Field(
         None,
@@ -88,6 +99,10 @@ def _summary_dict(s: RunSummary) -> dict:
     }
 
 
+def _parse_lines(combos: str) -> List[str]:
+    return [ln.strip() for ln in combos.splitlines() if ln.strip()]
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True}
@@ -98,11 +113,56 @@ def ping():
     return {"pong": True}
 
 
-@app.post("/api/check", response_model=CheckResponse)
-async def check_accounts(body: CheckRequest):
-    lines = [ln.strip() for ln in body.combos.splitlines() if ln.strip()]
+@app.post("/api/check/stream")
+def check_stream(body: CheckRequest):
+    """NDJSON stream: one JSON object per line — progress events + final done."""
+    lines = _parse_lines(body.combos)
     if not lines:
         raise HTTPException(status_code=400, detail="No combos provided")
+    if len(lines) > MAX_ACCOUNTS_PER_RUN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {MAX_ACCOUNTS_PER_RUN} accounts per run",
+        )
+
+    proxy_list: Optional[List[str]] = None
+    if body.proxies and body.proxies.strip():
+        proxy_list = [ln.strip() for ln in body.proxies.splitlines() if ln.strip()]
+
+    total = len(lines)
+
+    def ndjson_gen():
+        start = time.perf_counter()
+        results: List[CheckResult] = []
+        for result in iter_checks_sequential(lines, proxy_list, body.delay):
+            results.append(result)
+            line = json.dumps(
+                {
+                    "type": "progress",
+                    "current": len(results),
+                    "total": total,
+                    "result": check_result_to_dict(result),
+                },
+                ensure_ascii=False,
+            )
+            yield line + "\n"
+        elapsed = time.perf_counter() - start
+        summary = build_summary(results, elapsed)
+        yield json.dumps({"type": "done", "summary": _summary_dict(summary)}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
+
+
+@app.post("/api/check", response_model=CheckResponse)
+async def check_accounts(body: CheckRequest):
+    lines = _parse_lines(body.combos)
+    if not lines:
+        raise HTTPException(status_code=400, detail="No combos provided")
+    if len(lines) > MAX_ACCOUNTS_PER_RUN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {MAX_ACCOUNTS_PER_RUN} accounts per run",
+        )
 
     proxy_list: Optional[List[str]] = None
     if body.proxies and body.proxies.strip():
@@ -111,7 +171,7 @@ async def check_accounts(body: CheckRequest):
     def job():
         return run_checks_collecting(
             lines,
-            max_workers=body.threads,
+            max_workers=1,
             proxy_urls=proxy_list,
             extra_delay=body.delay,
         )
