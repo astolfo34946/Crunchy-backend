@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import random
+import re
 import sys
 import time
 import uuid
@@ -148,6 +149,66 @@ def _jwt_payload_dict(jwt_str: str) -> dict:
         return {}
 
 
+def _is_generic_status_label(s: str) -> bool:
+    """True for account status / marketing lines, not a plan type (Free, Premium, Mega Fan, …)."""
+    if not s or not isinstance(s, str):
+        return True
+    t = s.strip().lower()
+    if not t:
+        return True
+    if t in (
+        "active",
+        "inactive",
+        "unknown",
+        "none",
+        "n/a",
+        "na",
+        "valid",
+        "subscription active",
+        "subscription_active",
+        "active subscription",
+    ):
+        return True
+    plan_kw = ("premium", "fan", "mega", "trial", "family", "free", "ultimate", "hime", "paid")
+    if any(k in t for k in plan_kw):
+        return False
+    if "subscription" in t and "active" in t:
+        return True
+    return False
+
+
+def _sanitize_subscription_label(s: str) -> str:
+    if not s or not isinstance(s, str):
+        return ""
+    s = s.strip()
+    if _is_generic_status_label(s):
+        return ""
+    return s
+
+
+def _dict_has_key_bool(
+    obj: object,
+    key: str,
+    want: bool,
+    depth: int = 0,
+    max_depth: int = 14,
+) -> bool:
+    """True if ``key`` appears anywhere with boolean value ``want``."""
+    if depth > max_depth:
+        return False
+    if isinstance(obj, dict):
+        if obj.get(key) is want:
+            return True
+        return any(_dict_has_key_bool(v, key, want, depth + 1, max_depth) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_dict_has_key_bool(item, key, want, depth + 1, max_depth) for item in obj)
+    return False
+
+
+_PREMIUM_TRUE_RE = re.compile(r'"(?:is_)?premium"\s*:\s*true\b')
+_PREMIUM_FALSE_RE = re.compile(r'"(?:is_)?premium"\s*:\s*false\b')
+
+
 def _slug_to_label(s: str) -> str:
     s = (s or "").strip().lower().replace("-", "_").replace(" ", "_")
     mapping = {
@@ -174,14 +235,14 @@ def _slug_to_label(s: str) -> str:
         return "Premium"
     if "free" in s:
         return "Free"
-    return s.replace("_", " ").title() if s else ""
+    out = s.replace("_", " ").title() if s else ""
+    if _is_generic_status_label(out):
+        return ""
+    return out
 
 
 def _infer_subscription_from_dict(data: dict) -> str:
     """Best-effort label from Crunchyroll account / token JSON."""
-    if data.get("premium") is True or data.get("is_premium") is True:
-        return "Premium"
-
     for key in (
         "subscription_type",
         "tier",
@@ -213,22 +274,88 @@ def _infer_subscription_from_dict(data: dict) -> str:
                 if lbl:
                     return lbl
     if isinstance(sub, str) and sub.strip():
-        return _slug_to_label(sub) or sub.strip()
+        cand = _slug_to_label(sub) or sub.strip()
+        cand = _sanitize_subscription_label(cand)
+        if cand:
+            return cand
 
     blob = json.dumps(data).lower()
     if "mega_fan" in blob or "megafan" in blob:
         return "Mega Fan"
     if "trial" in blob and "subscription" in blob:
         return "Trial"
-    if "fan_membership" in blob or '"fan"' in blob:
+    if "fan_membership" in blob:
         if "mega" in blob:
             return "Mega Fan"
         return "Fan"
-    if "free" in blob and "premium" not in blob and "fan" not in blob:
-        return "Free"
-    if "premium" in blob:
+
+    # Explicit premium flags (root or nested). True before false so paid tiers win.
+    if (
+        data.get("premium") is True
+        or data.get("is_premium") is True
+        or data.get("has_premium") is True
+        or _dict_has_key_bool(data, "premium", True)
+        or _dict_has_key_bool(data, "is_premium", True)
+        or _dict_has_key_bool(data, "has_premium", True)
+        or _PREMIUM_TRUE_RE.search(blob)
+    ):
         return "Premium"
 
+    if (
+        data.get("premium") is False
+        or data.get("is_premium") is False
+        or data.get("has_premium") is False
+        or _dict_has_key_bool(data, "premium", False)
+        or _dict_has_key_bool(data, "is_premium", False)
+        or _dict_has_key_bool(data, "has_premium", False)
+        or _PREMIUM_FALSE_RE.search(blob)
+    ):
+        return "Free"
+
+    # No explicit paid-tier match; free-tier responses often omit premium keys entirely.
+    return "Free"
+
+
+def _deep_find_subscription_tier(data: dict, depth: int = 0, max_depth: int = 10) -> str:
+    """Walk nested account JSON for tier/plan fields; ignores generic status strings."""
+    if depth > max_depth or not isinstance(data, dict):
+        return ""
+    tier_keys = (
+        "subscription_type",
+        "tier",
+        "plan",
+        "product",
+        "sku",
+        "membership_type",
+        "fan_status",
+        "plan_name",
+        "offer_code",
+        "package_code",
+        "billing_plan",
+    )
+    for k in tier_keys:
+        if k not in data:
+            continue
+        v = data[k]
+        if isinstance(v, str) and v.strip():
+            lbl = _sanitize_subscription_label(_slug_to_label(v))
+            if lbl:
+                return lbl
+        if isinstance(v, dict):
+            inner = _deep_find_subscription_tier(v, depth + 1, max_depth)
+            if inner:
+                return inner
+    for v in data.values():
+        if isinstance(v, dict):
+            inner = _deep_find_subscription_tier(v, depth + 1, max_depth)
+            if inner:
+                return inner
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    inner = _deep_find_subscription_tier(item, depth + 1, max_depth)
+                    if inner:
+                        return inner
     return ""
 
 
@@ -237,23 +364,46 @@ def _fetch_subscription_label(
     access_token: str,
     token_body: Optional[dict] = None,
 ) -> str:
+    def _ok(lbl: str) -> bool:
+        return bool(_sanitize_subscription_label(lbl))
+
     # Hints from token response (id_token JWT, embedded objects)
     if token_body and isinstance(token_body, dict):
         id_tok = token_body.get("id_token")
         if isinstance(id_tok, str) and id_tok:
             claims = _jwt_payload_dict(id_tok)
             label = _infer_subscription_from_dict(claims)
-            if label:
-                return label
+            if _ok(label):
+                return _sanitize_subscription_label(label)
+            label = _deep_find_subscription_tier(claims)
+            if _ok(label):
+                return _sanitize_subscription_label(label)
         for k in ("crm_profile", "account", "profile"):
             nested = token_body.get(k)
             if isinstance(nested, dict):
                 label = _infer_subscription_from_dict(nested)
-                if label:
-                    return label
+                if _ok(label):
+                    return _sanitize_subscription_label(label)
+                label = _deep_find_subscription_tier(nested)
+                if _ok(label):
+                    return _sanitize_subscription_label(label)
         label = _infer_subscription_from_dict(token_body)
-        if label:
-            return label
+        if _ok(label):
+            return _sanitize_subscription_label(label)
+        label = _deep_find_subscription_tier(token_body)
+        if _ok(label):
+            return _sanitize_subscription_label(label)
+
+    # Access token JWT often carries CRM / tier claims (not only id_token).
+    if isinstance(access_token, str) and access_token:
+        claims = _jwt_payload_dict(access_token)
+        if claims:
+            label = _infer_subscription_from_dict(claims)
+            if _ok(label):
+                return _sanitize_subscription_label(label)
+            label = _deep_find_subscription_tier(claims)
+            if _ok(label):
+                return _sanitize_subscription_label(label)
 
     try:
         r = sess.get(
@@ -271,7 +421,12 @@ def _fetch_subscription_label(
         if not isinstance(data, dict):
             return "Unknown"
         label = _infer_subscription_from_dict(data)
-        return label if label else "Active"
+        if _ok(label):
+            return _sanitize_subscription_label(label)
+        label = _deep_find_subscription_tier(data)
+        if _ok(label):
+            return _sanitize_subscription_label(label)
+        return "Unknown"
     except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError):
         return "Unknown"
 
