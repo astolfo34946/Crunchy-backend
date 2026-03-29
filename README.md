@@ -18,11 +18,13 @@ Self-contained backend for [Render](https://render.com) or any Python host.
 
 3. After deploy, copy your service URL (e.g. `https://crunchyroll-checker-api.onrender.com`).
 
-4. **CORS:** In Render → your service → **Environment**, set:
+4. **CORS:** The API allows **`https://crunchyrool-checker.web.app`** and **`https://crunchyrool-cheker.firebaseapp.com`** by default (Firebase Hosting). For **any other** frontend URL, set in Render → **Environment**:
 
-   `CORS_ORIGINS` = `https://your-frontend-domain.com`
+   `CORS_ORIGINS` = `https://your-other-domain.com`
 
-   Comma-separate multiple origins if needed. No trailing slash. **`http://localhost:5173`** (and a few other local dev URLs) are **always allowed** in code—no need to list them unless you want to be explicit.
+   Comma-separate multiple origins. **No trailing slash.** Local dev (`http://localhost:5173`, etc.) is always merged in.
+
+   If the browser says *“blocked by CORS policy”* / *“No Access-Control-Allow-Origin”*, the **exact** page origin (scheme + host + port) is not in the allowed list—add it to `CORS_ORIGINS` and redeploy.
 
 5. **Redeploy** after env or code changes (Dashboard → Manual Deploy).
 
@@ -33,7 +35,7 @@ Self-contained backend for [Render](https://render.com) or any Python host.
 | Variable         | Purpose |
 |------------------|---------|
 | `CRUNCHYROLL_AUTH` | `Basic …` OAuth client header if the bundled client is rotated |
-| `CORS_ORIGINS`     | Comma-separated production origins (local Vite URLs are always merged in) |
+| `CORS_ORIGINS`     | Extra comma-separated origins (Firebase defaults + localhost are already merged in `server.py`) |
 
 ## Monorepo
 

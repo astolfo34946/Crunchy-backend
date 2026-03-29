@@ -25,7 +25,13 @@ from bot import RunSummary, check_result_to_dict, run_checks_collecting
 
 app = FastAPI(title="Crunchyroll Checker API")
 
-# Always allowed for local Vite/React dev (merged with CORS_ORIGINS from Render).
+# Built-in Firebase Hosting / default app URLs (no trailing slash). Add more via CORS_ORIGINS on Render.
+_CORS_BUILTIN = [
+    "https://crunchyrool-checker.web.app",
+    "https://crunchyrool-cheker.firebaseapp.com",
+]
+
+# Local Vite/React dev (always merged).
 _CORS_DEV_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://localhost:5173",
@@ -39,7 +45,7 @@ def _cors_origins() -> list[str]:
     from_env = [o.strip() for o in raw.split(",") if o.strip()] if raw else []
     seen: set[str] = set()
     out: list[str] = []
-    for o in from_env + _CORS_DEV_ORIGINS:
+    for o in from_env + _CORS_BUILTIN + _CORS_DEV_ORIGINS:
         if o not in seen:
             seen.add(o)
             out.append(o)
