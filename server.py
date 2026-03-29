@@ -96,6 +96,10 @@ def _summary_dict(s: RunSummary) -> dict:
         "bad_format": s.bad_format,
         "seconds": round(s.seconds, 2),
         "valid_lines": s.valid_lines,
+        "valid_entries": [
+            {"combo": e["combo"], "subscription": e.get("subscription") or ""}
+            for e in (s.valid_entries or [])
+        ],
     }
 
 

