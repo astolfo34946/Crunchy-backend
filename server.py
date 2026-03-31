@@ -33,6 +33,7 @@ from bot import (
     check_result_to_dict,
     iter_checks_sequential,
     run_checks_collecting,
+    WrongOAuthClientError,
 )
 
 app = FastAPI(title="Crunchyroll Checker API")
@@ -164,6 +165,15 @@ def check_stream(body: CheckRequest):
                 ensure_ascii=False,
             ) + "\n"
             return
+        except WrongOAuthClientError:
+            elapsed = time.perf_counter() - start
+            summary = build_summary(results, elapsed)
+            yield json.dumps({"type": "error", "error": "WRONG_OAUTH_CLIENT"}, ensure_ascii=False) + "\n"
+            yield json.dumps(
+                {"type": "done", "summary": _summary_dict(summary), "error": "WRONG_OAUTH_CLIENT"},
+                ensure_ascii=False,
+            ) + "\n"
+            return
 
     return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
 
@@ -195,6 +205,8 @@ async def check_accounts(body: CheckRequest):
         summary, results = await asyncio.to_thread(job)
     except AuthExpiredError as e:
         raise HTTPException(status_code=503, detail="AUTH_EXPIRED") from e
+    except WrongOAuthClientError as e:
+        raise HTTPException(status_code=503, detail="WRONG_OAUTH_CLIENT") from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 

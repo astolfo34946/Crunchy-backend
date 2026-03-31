@@ -120,6 +120,19 @@ class AuthExpiredError(RuntimeError):
     """Raised when Crunchyroll returns invalid_client / client_inactive."""
 
 
+class WrongOAuthClientError(RuntimeError):
+    """Raised when OAuth client rejects password grant_type."""
+
+
+def _normalize_auth_header(raw_auth: str) -> str:
+    auth = (raw_auth or "").strip().strip('"').strip("'")
+    if auth.lower().startswith("authorization:"):
+        auth = auth.split(":", 1)[1].strip()
+    if not auth.lower().startswith("basic "):
+        auth = f"Basic {auth}"
+    return auth
+
+
 def _contains_auth_expired_signal(status_code: int, body: object, raw_text: str) -> bool:
     if isinstance(body, dict):
         fields = [
@@ -169,8 +182,7 @@ def _proxy_dict_from_url(url: Optional[str]) -> Optional[Dict[str, str]]:
 
 
 def _random_browser_headers(auth: str) -> dict[str, str]:
-    if not auth.lower().startswith("basic "):
-        auth = f"Basic {auth}"
+    auth = _normalize_auth_header(auth)
     return {
         "Authorization": auth,
         "Content-Type": "application/x-www-form-urlencoded",
@@ -651,13 +663,8 @@ def check_credentials(
         )
 
     if "unsupported_grant_type" in low:
-        return CheckResult(
-            CheckStatus.ERROR,
-            email,
-            password,
-            "unsupported_grant_type (wrong OAuth client; this script expects Android TV credentials)",
-            "",
-        )
+        logger.error("WRONG_OAUTH_CLIENT: %s", err)
+        raise WrongOAuthClientError("WRONG_OAUTH_CLIENT")
 
     if (
         any(x in low for x in ("invalid_grant", "invalid_credentials", "incorrect"))
@@ -700,6 +707,9 @@ def auth_precheck(proxy_urls: Optional[List[str]] = None) -> None:
         )
     except AuthExpiredError:
         logger.error("AUTH_EXPIRED detected before batch start")
+        raise
+    except WrongOAuthClientError:
+        logger.error("WRONG_OAUTH_CLIENT detected before batch start")
         raise
     finally:
         sess.close()
@@ -799,6 +809,9 @@ def iter_checks_sequential(
                 result = check_combo_line_with_session(line, session, extra_delay=0.0)
             except AuthExpiredError:
                 logger.error("AUTH_EXPIRED during sequential run; stopping safely")
+                raise
+            except WrongOAuthClientError:
+                logger.error("WRONG_OAUTH_CLIENT during sequential run; stopping safely")
                 raise
             except Exception as e:
                 logger.exception("Unexpected error for combo line '%s': %s", line, e)
