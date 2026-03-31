@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from bot import (
+    AuthExpiredError,
     MAX_ACCOUNTS_PER_RUN,
     CheckResult,
     RunSummary,
@@ -138,21 +139,31 @@ def check_stream(body: CheckRequest):
     def ndjson_gen():
         start = time.perf_counter()
         results: List[CheckResult] = []
-        for result in iter_checks_sequential(lines, proxy_list, body.delay):
-            results.append(result)
-            line = json.dumps(
-                {
-                    "type": "progress",
-                    "current": len(results),
-                    "total": total,
-                    "result": check_result_to_dict(result),
-                },
+        try:
+            for result in iter_checks_sequential(lines, proxy_list, body.delay):
+                results.append(result)
+                line = json.dumps(
+                    {
+                        "type": "progress",
+                        "current": len(results),
+                        "total": total,
+                        "result": check_result_to_dict(result),
+                    },
+                    ensure_ascii=False,
+                )
+                yield line + "\n"
+            elapsed = time.perf_counter() - start
+            summary = build_summary(results, elapsed)
+            yield json.dumps({"type": "done", "summary": _summary_dict(summary)}, ensure_ascii=False) + "\n"
+        except AuthExpiredError:
+            elapsed = time.perf_counter() - start
+            summary = build_summary(results, elapsed)
+            yield json.dumps({"type": "error", "error": "AUTH_EXPIRED"}, ensure_ascii=False) + "\n"
+            yield json.dumps(
+                {"type": "done", "summary": _summary_dict(summary), "error": "AUTH_EXPIRED"},
                 ensure_ascii=False,
-            )
-            yield line + "\n"
-        elapsed = time.perf_counter() - start
-        summary = build_summary(results, elapsed)
-        yield json.dumps({"type": "done", "summary": _summary_dict(summary)}, ensure_ascii=False) + "\n"
+            ) + "\n"
+            return
 
     return StreamingResponse(ndjson_gen(), media_type="application/x-ndjson")
 
@@ -182,6 +193,8 @@ async def check_accounts(body: CheckRequest):
 
     try:
         summary, results = await asyncio.to_thread(job)
+    except AuthExpiredError as e:
+        raise HTTPException(status_code=503, detail="AUTH_EXPIRED") from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 

